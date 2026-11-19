@@ -1,0 +1,12 @@
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.Rapp.history
+.quarto/
+*.html
+output/
+.DS_Store
+renv/library/
+renv/staging/
+renv/sandbox/

@@ -1,0 +1,460 @@
+---
+title: "Does the new checkout improve conversion?"
+subtitle: "A synthetic A/B test of a redesigned checkout"
+date: "2026-11-02"
+date-format: "MMMM D, YYYY"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    embed-resources: true
+    smooth-scroll: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  freeze: false
+knitr:
+  opts_chunk:
+    fig-width: 8
+    fig-height: 4.8
+    dpi: 150
+---
+
+```{r}
+#| label: setup
+
+Sys.setenv(TZ = "UTC")
+library(tidyverse)
+library(broom)
+library(infer)
+library(scales)
+library(knitr)
+
+invisible(lapply(sort(list.files("R", pattern = "\\.R$", full.names = TRUE)), source))
+
+parameters <- readRDS("data/experiment_parameters.rds")
+users <- read_experiment_data("data/synthetic_experiment.csv")
+corrupted <- read_experiment_data("data/synthetic_experiment_corrupted.csv")
+settings <- default_decision_settings()
+
+validation <- validate_experiment(
+  users,
+  experiment_start = parameters$experiment_start,
+  experiment_end = parameters$experiment_end
+)
+if (!isTRUE(validation$ok)) {
+  stop("Critical validation checks failed. The report will not estimate effects from this table.", call. = FALSE)
+}
+
+metrics <- calculate_experiment_metrics(users)
+conversion <- analyze_conversion(users, alpha = settings$alpha)
+revenue <- analyze_revenue(
+  users,
+  reps = settings$bootstrap_reps,
+  seed = settings$bootstrap_seed,
+  alpha = settings$alpha
+)
+guardrail <- analyze_guardrails(users, alpha = settings$alpha)
+subgroups <- analyze_subgroups(users, alpha = settings$alpha)
+daily <- summarise_daily(users)
+sample_size <- estimate_sample_size(
+  baseline_rate = settings$planning_baseline_rate,
+  mde = settings$planning_mde,
+  alpha = settings$alpha,
+  power = settings$planning_power,
+  allocation_ratio = settings$planning_allocation_ratio
+)
+decision <- make_experiment_decision(
+  validation,
+  conversion,
+  guardrail,
+  min_practical_lift = settings$min_practical_lift,
+  max_acceptable_error_increase = settings$max_acceptable_error_increase
+)
+
+score_conversion <- conversion
+score_conversion$ci_low <- conversion$score_ci_low
+score_conversion$ci_high <- conversion$score_ci_high
+score_decision <- make_experiment_decision(
+  validation,
+  score_conversion,
+  guardrail,
+  min_practical_lift = settings$min_practical_lift,
+  max_acceptable_error_increase = settings$max_acceptable_error_increase
+)
+corrupted_validation <- validate_experiment(
+  corrupted,
+  experiment_start = parameters$experiment_start,
+  experiment_end = parameters$experiment_end
+)
+
+pct <- function(x, accuracy = 0.01) scales::percent(x, accuracy = accuracy)
+pp <- function(x) sprintf("%+.2f pp", 100 * x)
+money <- function(x) scales::dollar(x)
+show_table <- function(x) knitr::kable(x, format = "html", align = "l")
+```
+
+## Executive summary
+
+This report analyzes a **synthetic** checkout experiment. The users, purchases, and errors were simulated. The recommendation below is the output of the pre-specified decision rule, not a claim about a live website.
+
+Assigned users who saw the redesigned checkout converted at `r pct(conversion$treatment_rate)`, compared with `r pct(conversion$control_rate)` on the existing checkout. The treatment-minus-control difference is `r pp(conversion$absolute_difference)` (`r pct(conversion$relative_difference)` relative). The 95% Wald interval is `r pp(conversion$ci_low)` to `r pp(conversion$ci_high)`.
+
+At that rate, 10,000 assigned users would see about `r format(round(abs(conversion$absolute_difference * 10000)), big.mark = ",")` `r if (conversion$absolute_difference >= 0) "more" else "fewer"` purchases. Mean revenue per assigned user differs by `r money(revenue$absolute_difference)` (95% bootstrap interval `r money(revenue$ci_low)` to `r money(revenue$ci_high)`).
+
+Checkout errors differ by `r pp(guardrail$absolute_difference)` (95% interval `r pp(guardrail$ci_low)` to `r pp(guardrail$ci_high)`).
+
+::: {.callout-important}
+## Recommendation: `r decision$decision`
+
+`r decision$summary`
+:::
+
+The same rule, with a Newcombe score interval in place of the Wald interval, returns **`r score_decision$decision`**.
+
+## Business context
+
+An e-commerce team is testing a redesigned checkout. Each user is randomly assigned to one experience:
+
+- **Control:** the existing checkout.
+- **Treatment:** the redesigned checkout.
+
+The business question is whether assignment to the new checkout increases purchase conversion and revenue per assigned user without a material increase in checkout errors. Revenue is counted for every assigned user. Users who do not purchase contribute zero, so the metric matches the randomized population rather than the self-selected group of buyers.
+
+The practical bar is an absolute conversion lift of at least `r pct(settings$min_practical_lift)`. The guardrail limit is an absolute checkout-error increase of `r pct(settings$max_acceptable_error_increase)`. Both thresholds are business choices. They are not estimated from this sample.
+
+## Experiment design
+
+```{r}
+design <- tibble::tibble(
+  Setting = c(
+    "Unit of randomization",
+    "Assignment",
+    "Primary metric",
+    "Secondary metric",
+    "Guardrail",
+    "Experiment window",
+    "Significance level",
+    "Minimum practical conversion lift",
+    "Maximum acceptable error increase"
+  ),
+  Value = c(
+    "User",
+    "Independent 50/50 Bernoulli assignment",
+    "Purchase conversion",
+    "Revenue per assigned user, including non-purchasers",
+    "Checkout error rate",
+    sprintf(
+      "%s to %s, UTC, end exclusive",
+      format(parameters$experiment_start, "%Y-%m-%d"),
+      format(parameters$experiment_end, "%Y-%m-%d")
+    ),
+    pct(settings$alpha, accuracy = 1),
+    pct(settings$min_practical_lift),
+    pct(settings$max_acceptable_error_increase)
+  )
+)
+show_table(design)
+```
+
+Because assignment is random, the difference in outcomes estimates the average effect of being assigned to the new checkout. That interpretation depends on the design holding: one assignment per user, outcomes measured on the assigned users, and no interference between users. Those assumptions are true inside the simulator and have to be earned in a real product.
+
+The simulator's mean control conversion probability is `r pct(parameters$baseline_conversion)`, and the treatment probability is `r pp(parameters$treatment_conversion_lift)` higher before outcomes are drawn. Order values are lognormal, with means of `r money(parameters$mean_order_value[["control"]])` in control and `r money(parameters$mean_order_value[["treatment"]])` in treatment. The decision rule does not use these numbers. They are documented so the simulation can be audited.
+
+## Dataset description
+
+The analysis table has `r format(nrow(users), big.mark = ",")` users and one row per user. A second table, `data/synthetic_experiment_corrupted.csv`, contains planted data-quality failures and is not used for estimates.
+
+```{r}
+metric_table <- metrics |>
+  dplyr::transmute(
+    Variant = dplyr::if_else(variant == "control", "Control", "Treatment"),
+    Users = format(users, big.mark = ","),
+    `Conversion rate` = pct(conversion_rate),
+    `Revenue per user` = money(revenue_per_user),
+    `Average order value` = money(average_order_value),
+    `Checkout error rate` = pct(checkout_error_rate)
+  )
+show_table(metric_table)
+```
+
+Device, channel, and country change the conversion probability. Those effects are centered, so they do not move the average control rate. About `r pct(parameters$missing_country_rate, accuracy = 0.1)` of country values and `r pct(parameters$missing_channel_rate, accuracy = 0.1)` of traffic-source values are deleted at random. Primary estimates keep those users. `r if (parameters$n_clipped == 0) "No simulated conversion probabilities were clipped." else paste(parameters$n_clipped, "conversion probabilities were clipped to the allowed bounds.")`
+
+Weekdays are more likely to receive traffic than weekends. The experiment clock is UTC.
+
+## Data-quality and randomization checks
+
+Validation reports issues and leaves the table unchanged. Critical issues stop estimation. Warnings are reviewed and do not, by themselves, invalidate the experiment. Covariate balance is descriptive: a small p-value is a prompt to inspect the assignment logs, not proof that randomization failed.
+
+The sample-ratio check is a chi-squared goodness-of-fit test against a 50/50 allocation. It is critical only when p < 0.001. A 0.05 cutoff would flag too many healthy large experiments.
+
+```{r}
+issue_table <- function(issues) {
+  issues |>
+    dplyr::transmute(
+      Check = check_id,
+      Severity = severity,
+      `Rows affected` = format(n_affected, big.mark = ","),
+      Detail = message
+    )
+}
+show_table(issue_table(validation$issues))
+```
+
+Clean-data result: **`r if (validation$ok) "valid" else "invalid"`**, with `r validation$n_critical` critical issues and `r validation$n_warning` warnings. The sample-ratio statistic is `r sprintf("%.2f", validation$srm$statistic)` on `r validation$srm$df` degree of freedom (p = `r format_p(validation$srm$p_value)`). Observed counts are `r format(validation$srm$observed[["control"]], big.mark = ",")` control and `r format(validation$srm$observed[["treatment"]], big.mark = ",")` treatment.
+
+The corrupted file is the negative control for this step. It fails validation, and no effect estimates are calculated from it.
+
+```{r}
+show_table(issue_table(dplyr::filter(corrupted_validation$issues, severity != "info")))
+```
+
+Corrupted-data result: **`r if (corrupted_validation$ok) "valid" else "invalid"`**.
+
+## Exploratory analysis
+
+The charts below describe the sample. Per-group confidence intervals are not intervals for the treatment effect. Two group intervals can overlap even when the difference is distinguishable, and they can fail to overlap in a slice that was not pre-specified.
+
+```{r}
+#| fig-cap: "Purchase conversion by variant. Intervals are 95% Wilson intervals for each rate."
+plot_conversion_comparison(users)
+```
+
+```{r}
+#| fig-cap: "Purchase amounts among buyers. The mean revenue metric also includes users with zero revenue."
+plot_revenue_distribution(users)
+```
+
+```{r}
+#| fig-cap: "Daily conversion for assigned users. The axis starts at zero."
+plot_daily_conversion(users)
+```
+
+```{r}
+#| fig-cap: "Users assigned each day. The simulator sends more traffic on weekdays."
+plot_daily_volume(users)
+```
+
+```{r}
+#| include: false
+daily_users <- round(mean(daily$users))
+```
+
+Daily conversion stays in a band from `r pct(min(daily$conversion_rate))` to `r pct(max(daily$conversion_rate))`. That spread is what a rate near 10% looks like with about `r format(daily_users, big.mark = ",")` users in a variant-day. It is not a search for a winning day.
+
+```{r}
+#| fig-cap: "Conversion by device. This slice is exploratory."
+plot_conversion_by_group(users, "device_type", "Conversion rate by device")
+```
+
+```{r}
+#| fig-cap: "Conversion by acquisition channel. This slice is exploratory."
+plot_conversion_by_group(users, "traffic_source", "Conversion rate by acquisition channel")
+```
+
+```{r}
+#| fig-cap: "Checkout error rate by variant, with 95% Wilson intervals."
+plot_checkout_errors(users)
+```
+
+## Primary conversion analysis
+
+The primary question is two-sided.
+
+- **Null:** the treatment and control conversion probabilities are equal.
+- **Alternative:** the probabilities differ.
+
+The p-value is a pooled two-sample z-test, equivalent to a chi-squared test of equal proportions, without a continuity correction. The interval reported for the decision is the unpooled Wald interval for treatment minus control:
+
+\[
+(\hat p_T - \hat p_C) \pm z_{1-\alpha/2}\sqrt{\frac{\hat p_T(1-\hat p_T)}{n_T} + \frac{\hat p_C(1-\hat p_C)}{n_C}}.
+\]
+
+The pooled test and the unpooled interval can disagree in small samples. Here the p-value checks agree: `r conversion$p_checks_agree`. A hand-calculated pooled z-test and `infer::prop_test()` were both compared with `stats::prop.test()`. That function's interval matches this Wald interval: `r conversion$wald_matches_prop_test`. The Newcombe interval above is a different method for the same difference. The Wald interval `r if (conversion$significance_matches_wald_ci) "agrees" else "does not agree"` with the 0.05 test on whether zero is excluded.
+
+```{r}
+conversion_table <- tibble::tibble(
+  Quantity = c(
+    "Control conversion",
+    "Treatment conversion",
+    "Absolute difference (treatment - control)",
+    "Relative difference",
+    "95% Wald interval",
+    "95% Newcombe interval",
+    "Two-sided p-value",
+    "Significant at 5%"
+  ),
+  Value = c(
+    pct(conversion$control_rate),
+    pct(conversion$treatment_rate),
+    pp(conversion$absolute_difference),
+    pct(conversion$relative_difference),
+    paste(pp(conversion$ci_low), "to", pp(conversion$ci_high)),
+    paste(pp(conversion$score_ci_low), "to", pp(conversion$score_ci_high)),
+    formatC(conversion$p_value, format = "e", digits = 3),
+    if (conversion$significant) "Yes" else "No"
+  )
+)
+show_table(conversion_table)
+```
+
+In business terms, the point estimate is the extra purchase rate associated with assignment to the new checkout, and the interval is the range of purchase rates this sample can still support. Statistical significance answers a narrower question: whether a difference of exactly zero is plausible. The shipping rule asks for more than that.
+
+## Secondary revenue analysis
+
+Revenue per assigned user uses every randomized user. Buyers contribute a positive amount. Everyone else contributes zero. Average order value is reported only as a description of buyers. It is not the causal contrast, because the set of buyers is affected by the treatment.
+
+Purchase amounts are right-skewed and piled up at zero, so a normal interval for the mean is a poor default. The interval here is the 2.5th and 97.5th percentiles of `r format(revenue$reps, big.mark = ",")` stratified bootstrap replicates. Each replicate redraws users inside control and inside treatment, keeping the original group sizes. The seed is `r revenue$seed`.
+
+```{r}
+revenue_table <- tibble::tibble(
+  Quantity = c(
+    "Control revenue per user",
+    "Treatment revenue per user",
+    "Absolute difference (treatment - control)",
+    "Relative difference",
+    "95% bootstrap interval",
+    "Bootstrap replicates"
+  ),
+  Value = c(
+    money(revenue$control_mean),
+    money(revenue$treatment_mean),
+    money(revenue$absolute_difference),
+    pct(revenue$relative_difference),
+    paste(money(revenue$ci_low), "to", money(revenue$ci_high)),
+    format(revenue$reps, big.mark = ",")
+  )
+)
+show_table(revenue_table)
+```
+
+The revenue difference is about `r money(revenue$absolute_difference * 10000)` per 10,000 assigned users. It is supportive context for the conversion result. It is not a second primary endpoint, and it is not adjusted as if it were one.
+
+## Guardrail assessment
+
+Checkout errors are the guardrail. A higher error rate would count against shipping even if conversion improved. The comparison uses the same proportion methods as the primary metric, with the difference defined as treatment minus control.
+
+```{r}
+guardrail_table <- tibble::tibble(
+  Quantity = c(
+    "Control error rate",
+    "Treatment error rate",
+    "Absolute difference (treatment - control)",
+    "95% Wald interval",
+    "Two-sided p-value"
+  ),
+  Value = c(
+    pct(guardrail$control_rate),
+    pct(guardrail$treatment_rate),
+    pp(guardrail$absolute_difference),
+    paste(pp(guardrail$ci_low), "to", pp(guardrail$ci_high)),
+    formatC(guardrail$p_value, format = "f", digits = 3)
+  )
+)
+show_table(guardrail_table)
+```
+
+`r guardrail$interpretation`
+
+In this simulator the treatment label does not change the error probability. Mobile users are assigned a higher error probability than desktop users. The analysis does not use that fact. It uses the observed difference and the pre-specified limit of `r pct(settings$max_acceptable_error_increase)`. An interval that includes zero would not, on its own, count as evidence of safety.
+
+## Subgroup exploration
+
+The cuts below were not part of the shipping rule. Each row is a separate 95% Wald interval. Nothing is adjusted for the number of slices.
+
+`r subgroups$caveat`
+
+```{r}
+subgroup_table <- subgroups$estimates |>
+  dplyr::transmute(
+    Slice = group_var,
+    Group = group,
+    Control = format(control_n, big.mark = ","),
+    Treatment = format(treatment_n, big.mark = ","),
+    Difference = pp(absolute_difference),
+    `95% interval` = paste(pp(ci_low), "to", pp(ci_high)),
+    `p-value` = formatC(p_value, format = "f", digits = 3)
+  )
+show_table(subgroup_table)
+```
+
+A significant result in one row and a nonsignificant result in another does not show that the effects differ. Comparing the intervals, or estimating the interaction directly, would be a different analysis, and it would still be exploratory unless it had been specified in advance.
+
+Users with a missing device or traffic source are left out of that slice only. They remain in the primary analysis.
+
+## Statistical power and sample size
+
+The sample-size calculation is a planning tool. It asks how many users a future test needs in order to detect a chosen absolute lift at a chosen error rate. It is not the observed power of this experiment. Observed power rearranges the p-value and does not add information beyond the estimate and the interval.
+
+The formula is the normal approximation behind `stats::power.prop.test()` for a two-sided test without a continuity correction. Outcomes are treated as independent Bernoulli trials. For a 50/50 test the result is checked against that R function.
+
+```{r}
+power_table <- tibble::tibble(
+  Input = c(
+    "Baseline conversion",
+    "Minimum detectable effect",
+    "Alternative conversion",
+    "Alpha",
+    "Power",
+    "Allocation",
+    "Control users",
+    "Treatment users",
+    "Total users"
+  ),
+  Value = c(
+    pct(sample_size$baseline_rate, accuracy = 1),
+    pp(sample_size$mde),
+    pct(sample_size$alternative_rate),
+    pct(sample_size$alpha, accuracy = 1),
+    pct(sample_size$power, accuracy = 1),
+    "50/50",
+    format(sample_size$n_control, big.mark = ","),
+    format(sample_size$n_treatment, big.mark = ","),
+    format(sample_size$n_total, big.mark = ",")
+  )
+)
+show_table(power_table)
+```
+
+A future experiment that must reliably detect a 1 percentage point lift from a 10% baseline, at 5% significance and 80% power, needs about `r format(sample_size$n_control, big.mark = ",")` users **per variant**. This case study randomized about `r format(nrow(users), big.mark = ",")` users in total, near `r format(round(nrow(users) / 2), big.mark = ",")` per variant. It was not sized for that 1 point target. That fact does not change the estimate. The interval already shows the precision this sample delivered.
+
+## Business recommendation
+
+The recommendation is **`r decision$decision`**.
+
+The rule does not use the p-value. It uses the validation status, the conversion interval, the checkout-error interval, and two thresholds that have to be chosen before looking at the result.
+
+```{r}
+show_table(decision_rules())
+```
+
+Applied to this sample, the reasons are:
+
+`r decision$summary`
+
+Thresholds used: minimum practical conversion lift `r pct(decision$min_practical_lift)`, maximum acceptable error increase `r pct(decision$max_acceptable_error_increase)`.
+
+Using the Newcombe score interval instead of the Wald interval, the rule returns **`r score_decision$decision`**. `r if (score_decision$decision == decision$decision) "The two intervals support the same action." else "The two intervals do not support the same action, so the result is sensitive to the interval method."`
+
+## Limitations and next steps
+
+The findings describe the simulated assignment, not a production checkout.
+
+```{r}
+#| results: asis
+cat(paste0("- ", parameters$limitations, "\n"), sep = "\n")
+```
+
+Further limits of the analysis:
+
+- There is one primary comparison. Revenue and the guardrail are interpreted beside it, not as a family of tests with a multiplicity correction.
+- The conversion interval used for the decision is a large-sample Wald interval. A Newcombe score interval is reported as a second method. `stats::prop.test()` returns the same Wald interval, truncated to [-1, 1], so it is a calculation check rather than a different interval.
+- The bootstrap describes uncertainty for the mean revenue difference. It does not describe the median buyer or the chance that a particular user spends more.
+- Subgroup intervals are unadjusted. They are a place to look, not a place to declare a winner.
+- No pre-treatment covariate is used to reduce variance. With a randomized experiment that would change precision, not the target, but it was not done here.
+- The practical thresholds are explicit so they can be challenged. A different bar can change the recommendation without any change in the data.
+
+A next experiment that needs to detect a 1 percentage point lift should be sized with the planning calculation above, with the guardrail limit written down before assignment starts. If the real product randomizes sessions instead of users, or if users can see both experiences, the analysis in this report is the wrong unit.
