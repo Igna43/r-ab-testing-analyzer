@@ -10,7 +10,9 @@
     "LinkingTo"
   ],
   "ppm.enabled": null,
-  "ppm.ignored.urls": [],
+  "ppm.ignored.urls": [
+    "https://cloud.r-project.org"
+  ],
   "r.version": null,
   "snapshot.dev": false,
   "snapshot.type": "implicit",

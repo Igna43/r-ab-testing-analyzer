@@ -18,6 +18,9 @@ jobs:
           r-version: "4.6.2"
           use-public-rspm: true
 
+      - name: Keep CRAN available when a Linux binary is missing
+        run: echo "RENV_CONFIG_REPOS_OVERRIDE=PPM=${RSPM};CRAN=https://cloud.r-project.org" >> "$GITHUB_ENV"
+
       - uses: r-lib/actions/setup-renv@v2
 
       - uses: quarto-dev/quarto-actions/setup@v2
